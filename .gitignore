@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*_sanitizado.xlsx
+uploaded_simulador.xlsx

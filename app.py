@@ -5,6 +5,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from xlcalculator import ModelCompiler, Evaluator
 from pathlib import Path
+import re
 
 # =========================
 # STREAMLIT CONFIG + HEARTBEAT
@@ -152,15 +153,78 @@ def safe_eval(evaluator: Evaluator, addr: str):
         return f"Erro: {e}"
 
 
+def last_used_row(ws) -> int:
+    """
+    Descobre a última linha com dados (para limitar intervalos gigantes como A:N).
+    """
+    last = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value not in (None, ""):
+                last = max(last, cell.row)
+    return last or 1
+
+
+def clamp_column_ranges(formula: str, sheet_max_rows: dict[str, int]) -> str:
+    """
+    Converte intervalos do tipo Sheet!A:N (coluna inteira) para Sheet!A1:N<última linha usada>.
+    Isso evita que o xlcalculator tente expandir 1.048.576 linhas e trave.
+    """
+    pattern = re.compile(
+        r"""((?:'[^']+'|[^'!]+))!\$?([A-Z]+):\$?([A-Z]+)(?![0-9])"""
+    )
+
+    def _replace(match: re.Match) -> str:
+        sheet_token, col1, col2 = match.groups()
+        sheet_name = sheet_token.strip("'")
+        max_row = sheet_max_rows.get(sheet_name, 2000)
+        return f"{sheet_token}!{col1}1:{col2}{max_row}"
+
+    return pattern.sub(_replace, formula)
+
+
+@st.cache_data(show_spinner="⏳ Ajustando planilha para o motor de cálculo...")
+def prepare_workbook_for_engine(original_path: str, mtime: float):
+    """
+    Cria uma cópia sanitizada do XLSX, limitando intervalos de coluna inteira.
+    Retorna o caminho da cópia (ou o original, se nada precisar ser ajustado).
+    Cacheia por caminho + mtime para não refazer sem necessidade.
+    """
+    src = Path(original_path)
+
+    wb = openpyxl.load_workbook(src, data_only=False)
+
+    sheet_max_rows = {ws.title: last_used_row(ws) for ws in wb.worksheets}
+
+    changed = False
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                val = cell.value
+                if not (isinstance(val, str) and val.startswith("=")):
+                    continue
+                new_formula = clamp_column_ranges(val, sheet_max_rows)
+                if new_formula != val:
+                    cell.value = new_formula
+                    changed = True
+
+    if not changed:
+        return src, mtime
+
+    safe_name = src.with_name(f"{src.stem}_sanitizado.xlsx")
+    wb.save(safe_name)
+    return safe_name, safe_name.stat().st_mtime
+
+
 @st.cache_resource
-def load_engine(xlsx_path: str):
+def load_engine(xlsx_path: str, cache_buster: float):
     compiler = ModelCompiler()
     model = compiler.read_and_parse_archive(xlsx_path)
     return Evaluator(model)
 
 
 @st.cache_data
-def cached_inputs(xlsx_path: str, sheet_name: str):
+def cached_inputs(xlsx_path: str, cache_buster: float, sheet_name: str):
     return discover_inputs(xlsx_path, sheet_name)
 
 
@@ -194,14 +258,26 @@ if xlsx_path.name.startswith("~$"):
 st.success(f"📄 Planilha selecionada: **{xlsx_path.name}**")
 
 # =========================
+# SANITIZAÇÃO (intervalos de coluna inteira -> limitados)
+# =========================
+xlsx_mtime = xlsx_path.stat().st_mtime
+sanitized_path, cache_buster = prepare_workbook_for_engine(str(xlsx_path), xlsx_mtime)
+if sanitized_path != xlsx_path:
+    st.info(
+        "🔧 Ajustei intervalos de coluna inteira (ex.: A:N) para evitar travamento "
+        "do motor de fórmulas. Os cálculos continuam equivalentes ao Excel."
+    )
+
+# =========================
 # DEBUG PANEL
 # =========================
 with st.expander("🛠️ Debug (ver detalhes)", expanded=False):
     st.write("📍 Pasta atual:", str(Path('.').resolve()))
-    st.write("📍 Arquivo XLSX:", str(xlsx_path.resolve()))
+    st.write("📍 Arquivo XLSX original:", str(xlsx_path.resolve()))
+    st.write("📍 Arquivo usado no motor:", str(sanitized_path.resolve()))
 
     try:
-        wb_dbg = openpyxl.load_workbook(str(xlsx_path), data_only=False)
+        wb_dbg = openpyxl.load_workbook(str(sanitized_path), data_only=False)
         st.write("📄 Abas encontradas:", wb_dbg.sheetnames)
     except Exception:
         st.error("Falha ao abrir o Excel via openpyxl (apenas leitura).")
@@ -213,7 +289,7 @@ with st.expander("🛠️ Debug (ver detalhes)", expanded=False):
 st.write("Debug: antes de carregar engine do Excel (xlcalculator)")
 
 try:
-    engine = load_engine(str(xlsx_path))
+    engine = load_engine(str(sanitized_path), cache_buster)
     st.success("✅ Engine do Excel carregada (xlcalculator).")
 except Exception:
     st.error("❌ Falha ao carregar engine do Excel (xlcalculator).")
@@ -226,7 +302,7 @@ except Exception:
 st.write("Debug: antes de descobrir inputs na planilha")
 
 try:
-    inputs = cached_inputs(str(xlsx_path), MAIN_SHEET)
+    inputs = cached_inputs(str(sanitized_path), cache_buster, MAIN_SHEET)
     st.success(f"✅ Inputs descobertos: {len(inputs)}")
 except Exception:
     st.error("❌ Falha ao ler a planilha / aba / inputs.")
@@ -252,7 +328,7 @@ st.caption("Edite os campos. Clique em **Calcular** para atualizar os KPIs.")
 
 edited = st.data_editor(
     df[["label", "address", "value"]],
-    use_container_width=True,
+    width="stretch",
     num_rows="fixed",
     column_config={
         "label": st.column_config.TextColumn("Campo"),
