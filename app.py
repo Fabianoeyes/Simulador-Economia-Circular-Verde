@@ -1,10 +1,14 @@
-import streamlit as st
+import io
+import hashlib
 import traceback
-import pandas as pd
-import openpyxl
-from openpyxl.utils import get_column_letter
-from xlcalculator import ModelCompiler, Evaluator
 from pathlib import Path
+
+import openpyxl
+import pandas as pd
+import streamlit as st
+from openpyxl.utils import get_column_letter
+from xlcalculator import Evaluator, model, xltypes
+from xlcalculator.xlfunctions import func_xltypes, logical, xl
 
 # =========================
 # STREAMLIT CONFIG + HEARTBEAT
@@ -81,9 +85,7 @@ def is_probably_input_cell(cell) -> bool:
     return False
 
 
-def discover_inputs(xlsx_path: str, sheet_name: str):
-    wb = openpyxl.load_workbook(xlsx_path, data_only=False)
-
+def discover_inputs(wb: openpyxl.Workbook, sheet_name: str):
     if sheet_name not in wb.sheetnames:
         raise ValueError(
             f"Aba '{sheet_name}' não encontrada.\n"
@@ -147,21 +149,92 @@ def coerce_value(v):
 
 def safe_eval(evaluator: Evaluator, addr: str):
     try:
-        return evaluator.evaluate(addr)
+        return _unwrap_excel_value(evaluator.evaluate(addr))
     except Exception as e:
         return f"Erro: {e}"
 
 
-@st.cache_resource
-def load_engine(xlsx_path: str):
-    compiler = ModelCompiler()
-    model = compiler.read_and_parse_archive(xlsx_path)
-    return Evaluator(model)
+def _unwrap_excel_value(val):
+    """Converte ExcelTypes / Arrays do xlcalculator em valores Python simples."""
+    if isinstance(val, func_xltypes.Expr):
+        val = val()
+    if isinstance(val, func_xltypes.Array):
+        flat = list(val.values.flat)
+        return _unwrap_excel_value(flat[0]) if flat else None
+    if hasattr(val, "value") and not isinstance(val, (int, float, str, bool)):
+        try:
+            return val.value
+        except Exception:
+            pass
+    return val
+
+
+# Monkeypatch do IF para lidar com Arrays de 1x1 e ramos não-callable
+@xl.register()
+@xl.validate_args
+def IF_SAFE(
+    logical_test: func_xltypes.XlExpr,
+    value_if_true: func_xltypes.XlExpr = True,
+    value_if_false: func_xltypes.XlExpr = False,
+):
+    cond = _unwrap_excel_value(logical_test)
+    true_fn = value_if_true if callable(value_if_true) else lambda: value_if_true
+    false_fn = value_if_false if callable(value_if_false) else lambda: value_if_false
+    chosen = true_fn if bool(cond) else false_fn
+    return _unwrap_excel_value(chosen())
+
+
+logical.IF = IF_SAFE
+xl.FUNCTIONS["IF"] = IF_SAFE
+
+
+def build_model_from_workbook(wb: openpyxl.Workbook) -> model.Model:
+    """
+    Constrói um Model manualmente (mais leve que ModelCompiler para esta planilha).
+    - Só cria ranges quando há ":" (intervalos reais), evitando Arrays 1x1.
+    """
+    mdl = model.Model()
+
+    for ws in wb.worksheets:
+        sheet = ws.title
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if v is None:
+                    continue
+
+                addr = f"{sheet}!{cell.coordinate}"
+                has_formula = isinstance(v, str) and v.startswith("=")
+                xl_cell = xltypes.XLCell(addr, value=None if has_formula else v)
+
+                if has_formula:
+                    xl_cell.formula = xltypes.XLFormula(
+                        v, sheet_name=sheet, reference=addr
+                    )
+                    for term in xl_cell.formula.terms:
+                        if ":" in term and term not in mdl.ranges:
+                            mdl.ranges[term] = xltypes.XLRange(term, term)
+
+                mdl.cells[addr] = xl_cell
+                if xl_cell.formula:
+                    mdl.formulae[addr] = xl_cell.formula
+
+    mdl.build_code()
+    return mdl
+
+
+@st.cache_resource(hash_funcs={bytes: lambda b: hashlib.sha256(b).hexdigest()})
+def load_engine_from_bytes(xlsx_bytes: bytes):
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    mdl = build_model_from_workbook(wb)
+    return Evaluator(mdl)
 
 
 @st.cache_data
-def cached_inputs(xlsx_path: str, sheet_name: str):
-    return discover_inputs(xlsx_path, sheet_name)
+def cached_inputs(xlsx_bytes: bytes, sheet_name: str):
+    with io.BytesIO(xlsx_bytes) as bio:
+        wb = openpyxl.load_workbook(bio, data_only=False)
+    return discover_inputs(wb, sheet_name)
 
 
 # =========================
@@ -174,34 +247,47 @@ with st.expander("📤 (Opcional) Trocar planilha por upload", expanded=False):
     )
     st.info("Se você não fizer upload, o app usa o .xlsx encontrado na pasta do projeto.")
 
-xlsx_path = None
+xlsx_bytes: bytes | None = None
+xlsx_name: str | None = None
+xlsx_path: Path | None = None
 
 if uploaded is not None:
-    tmp_path = Path("uploaded_simulador.xlsx")
-    tmp_path.write_bytes(uploaded.getvalue())
-    xlsx_path = tmp_path
+    xlsx_bytes = uploaded.getvalue()
+    xlsx_name = uploaded.name
 else:
     xlsx_path = find_workbook_in_cwd()
+    if xlsx_path:
+        xlsx_bytes = xlsx_path.read_bytes()
+        xlsx_name = xlsx_path.name
 
-if xlsx_path is None:
-    st.error("❌ Não encontrei nenhum arquivo .xlsx válido na pasta do projeto. Coloque o Excel junto do app.py.")
+if xlsx_bytes is None or xlsx_name is None:
+    st.error(
+        "❌ Não encontrei nenhum arquivo .xlsx válido na pasta do projeto. "
+        "Coloque o Excel junto do app.py ou faça upload."
+    )
     st.stop()
 
-if xlsx_path.name.startswith("~$"):
-    st.error("❌ Você selecionou um arquivo temporário do Excel (começa com '~$'). Feche o Excel e use o arquivo real.")
+if xlsx_name.startswith("~$"):
+    st.error(
+        "❌ Você selecionou um arquivo temporário do Excel (começa com '~$'). "
+        "Feche o Excel e use o arquivo real."
+    )
     st.stop()
 
-st.success(f"📄 Planilha selecionada: **{xlsx_path.name}**")
+st.success(f"📄 Planilha selecionada: **{xlsx_name}**")
 
 # =========================
 # DEBUG PANEL
 # =========================
 with st.expander("🛠️ Debug (ver detalhes)", expanded=False):
     st.write("📍 Pasta atual:", str(Path('.').resolve()))
-    st.write("📍 Arquivo XLSX:", str(xlsx_path.resolve()))
+    if xlsx_path:
+        st.write("📍 Arquivo XLSX:", str(xlsx_path.resolve()))
+    else:
+        st.write("📍 Arquivo XLSX (upload):", xlsx_name)
 
     try:
-        wb_dbg = openpyxl.load_workbook(str(xlsx_path), data_only=False)
+        wb_dbg = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
         st.write("📄 Abas encontradas:", wb_dbg.sheetnames)
     except Exception:
         st.error("Falha ao abrir o Excel via openpyxl (apenas leitura).")
@@ -213,7 +299,7 @@ with st.expander("🛠️ Debug (ver detalhes)", expanded=False):
 st.write("Debug: antes de carregar engine do Excel (xlcalculator)")
 
 try:
-    engine = load_engine(str(xlsx_path))
+    engine = load_engine_from_bytes(xlsx_bytes)
     st.success("✅ Engine do Excel carregada (xlcalculator).")
 except Exception:
     st.error("❌ Falha ao carregar engine do Excel (xlcalculator).")
@@ -226,7 +312,7 @@ except Exception:
 st.write("Debug: antes de descobrir inputs na planilha")
 
 try:
-    inputs = cached_inputs(str(xlsx_path), MAIN_SHEET)
+    inputs = cached_inputs(xlsx_bytes, MAIN_SHEET)
     st.success(f"✅ Inputs descobertos: {len(inputs)}")
 except Exception:
     st.error("❌ Falha ao ler a planilha / aba / inputs.")
